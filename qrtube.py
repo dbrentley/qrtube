@@ -1,92 +1,132 @@
 import json
+import os
 import sys
+from multiprocessing import Pool, cpu_count, Manager
 
 import qrcode
 from PIL import Image
+from moviepy.editor import ImageSequenceClip
 
 
-def main(file_path):
-    # Image dimensions and QR code parameters
+def create_directory(dir_name):
+    if not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+
+
+def generate_frame(args):
+    (
+        frame_data,
+        output_dir,
+        frame_number,
+        img_width,
+        img_height,
+        qr_box_size,
+        qr_border,
+        qr_size,
+        num_horizontal,
+        num_vertical,
+    ) = args
+    final_img = Image.new("RGB", (img_width, img_height), "white")
+
+    for i, data_chunk in enumerate(frame_data):
+        qr = qrcode.QRCode(
+            version=40,
+            error_correction=qrcode.constants.ERROR_CORRECT_H,
+            box_size=qr_box_size,
+            border=qr_border,
+        )
+        qr.add_data(data_chunk)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+
+        x = (i % num_horizontal) * qr_size
+        y = (i // num_horizontal) * qr_size
+
+        final_img.paste(qr_img, (x, y))
+
+    frame_filename = os.path.join(output_dir, f"frame_{frame_number}.png")
+    final_img.save(frame_filename, format="PNG", optimize=True, compression_level=9)
+    return frame_filename
+
+
+def update_progress(result, progress, total_frames):
+    progress.append(result)
+    completed = len(progress)
+    percentage = (completed / total_frames) * 100
+    print(f"Progress: {percentage:.2f}% ({completed}/{total_frames} frames)")
+
+
+def generate_frames(file_path, output_dir):
     img_width, img_height = 3840, 2160
-    max_capacity = 1273  # bytes for each QR code with high error correction
-    qr_box_size = 4  # Size of each box in pixels
-    qr_border = 1  # Border size in boxes
-    qr_size = 177 * qr_box_size + 2 * qr_border  # Total QR code size including border
+    max_capacity = 1273
+    qr_box_size = 4
+    qr_border = 1
+    qr_size = 177 * qr_box_size + 2 * qr_border
 
-    # Calculate how many QR codes fit horizontally and vertically
     num_horizontal = img_width // qr_size
     num_vertical = img_height // qr_size
-    qr_codes_per_image = num_horizontal * num_vertical
+    qr_codes_per_frame = num_horizontal * num_vertical
 
-    # Determine the total size of the file
-    total_file_size = 0
-    with open(file_path, "rb") as file:
-        file.seek(0, 2)  # Move the cursor to the end of the file
-        total_file_size = file.tell()
-
-    # Calculate the total number of QR codes needed
+    total_file_size = os.path.getsize(file_path)
     total_qr_codes = (total_file_size + max_capacity - 1) // max_capacity
+    total_frames = (total_qr_codes + qr_codes_per_frame - 1) // qr_codes_per_frame
 
-    # Metadata for the first QR code
     metadata = {
-        "file_name": file_path.split("/")[-1],
+        "file_name": os.path.basename(file_path),
         "file_size": total_file_size,
-        "total_qr_codes": total_qr_codes + 1,  # Including the metadata QR code
+        "total_qr_codes": total_qr_codes,
+        "total_frames": total_frames,
     }
     metadata_json = json.dumps(metadata)
 
-    # Open the file again to read and process in chunks
     with open(file_path, "rb") as file:
-        image_number = 0
-        qr_code_index = 0  # Index of QR code in the current image
-        processed_bytes = 0  # Total bytes processed so far
+        file_chunks = [metadata_json] + [
+            file.read(max_capacity) for _ in range(total_qr_codes)
+        ]
 
-        while True:
-            # Handle metadata QR code
-            if image_number == 0 and qr_code_index == 0:
-                data_chunk = metadata_json
-            else:
-                data_chunk = file.read(max_capacity)
-                if not data_chunk:
-                    break  # Break if no more data to read
+    # Organize data into frames
+    frame_data = [
+        file_chunks[i : i + qr_codes_per_frame]
+        for i in range(0, len(file_chunks), qr_codes_per_frame)
+    ]
 
-            processed_bytes += len(data_chunk)
-            progress_percentage = (processed_bytes / total_file_size) * 100
+    manager = Manager()
+    progress = manager.list()
 
-            # Create a new image if needed
-            if qr_code_index % qr_codes_per_image == 0 and qr_code_index > 0:
-                final_img.save(f"final_qr_grid_{image_number}.png")
-                image_number += 1
-                qr_code_index = 0  # Reset QR code index for new image
-                print(f"Progress: {progress_percentage:.2f}%")
+    pool = Pool(cpu_count())
+    for frame_number, data in enumerate(frame_data):
+        args = (
+            data,
+            output_dir,
+            frame_number,
+            img_width,
+            img_height,
+            qr_box_size,
+            qr_border,
+            qr_size,
+            num_horizontal,
+            num_vertical,
+        )
+        pool.apply_async(
+            generate_frame,
+            args=(args,),
+            callback=lambda result: update_progress(result, progress, total_frames),
+        )
 
-            if qr_code_index == 0:
-                final_img = Image.new("RGB", (img_width, img_height), "white")
+    pool.close()
+    pool.join()
 
-            # Generate QR code
-            qr = qrcode.QRCode(
-                version=40,
-                error_correction=qrcode.constants.ERROR_CORRECT_H,
-                box_size=qr_box_size,
-                border=qr_border,
-            )
-            qr.add_data(data_chunk)
-            qr.make(fit=True)
-            qr_img = qr.make_image(fill_color="black", back_color="white")
+    return list(progress)
 
-            # Calculate position relative to the current image
-            x = (qr_code_index % num_horizontal) * qr_size
-            y = (qr_code_index // num_horizontal) * qr_size
 
-            # Place QR code on the final image
-            final_img.paste(qr_img, (x, y))
-
-            qr_code_index += 1
-
-        # Save the last image if it has any QR codes
-        if qr_code_index % qr_codes_per_image > 0:
-            final_img.save(f"final_qr_grid_{image_number}.png")
-            print(f"Progress: {progress_percentage:.2f}%")
+# ffmpeg -r 60 -i frame_%d.png -c:v libx265 -crf 38 -threads auto out.mp4
+# ffmpeg -r 60 -i frame_%d.png -c:v h264_nvenc out.mp4
+# ffmpeg -y -vsync 0 -c:v h264_cuvid -i input.mp4 output.yuv
+def create_video(frame_filenames, output_dir, fps=60):
+    clip = ImageSequenceClip(frame_filenames, fps=fps)
+    video_file = os.path.join(output_dir, "output_video.mp4")
+    # clip.write_videofile(video_file, codec="libx264")
+    clip.write_videofile(video_file, codec="h264_nvenc")
 
 
 if __name__ == "__main__":
@@ -94,4 +134,10 @@ if __name__ == "__main__":
         print("Usage: python script.py <file_path>")
         sys.exit(1)
 
-    main(sys.argv[1])
+    file_path = sys.argv[1]
+    output_dir = f"{os.path.splitext(file_path)[0]}_frames"
+    create_directory(output_dir)
+
+    frame_filenames = generate_frames(file_path, output_dir)
+    # create_video(frame_filenames, output_dir)
+    # print("Video creation completed.")
